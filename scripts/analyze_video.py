@@ -111,9 +111,47 @@ def extract_captions_ytdlp(url, workdir):
         return None
 
 
+def is_direct_video_url(url):
+    """Check if a URL points directly to a video file (not a streaming site)."""
+    direct_exts = (".mp4", ".webm", ".mkv", ".avi", ".mov", ".m4v", ".gif", ".mpg", ".mpeg")
+    path_part = url.split("?")[0].split("#")[0].lower()
+    return path_part.endswith(direct_exts)
+
+
+def download_direct_url(url, workdir):
+    """Download a direct video URL via curl. Returns path to video file."""
+    log("Downloading direct video URL via curl...")
+    ext = ".mp4"
+    for known_ext in (".mp4", ".webm", ".mkv", ".mov", ".m4v"):
+        if url.lower().endswith(known_ext):
+            ext = known_ext
+            break
+    out_path = f"{workdir}/video{ext}"
+    result = subprocess.run(
+        ["curl", "-L", "-o", out_path, url],
+        capture_output=True, text=True, timeout=300
+    )
+    if result.returncode == 0 and os.path.exists(out_path):
+        log(f"Downloaded to {out_path}")
+        return out_path
+    log(f"Direct download failed: {result.stderr[:200]}")
+    return None
+
+
 def download_video(url, workdir):
-    """Download video via yt-dlp. Returns path to video file and metadata."""
+    """Download video via yt-dlp (or fall back to curl for direct URLs). Returns path to video file and metadata."""
     log("Downloading video...")
+
+    # Try direct download first for obvious video-file URLs (fast, no yt-dlp overhead)
+    video_path = None
+    title = "Unknown"
+
+    if is_direct_video_url(url):
+        video_path = download_direct_url(url, workdir)
+        if video_path:
+            return video_path, url.rsplit("/", 1)[-1].split("?")[0]
+
+    # Otherwise try yt-dlp
     try:
         # Get title first (metadata only, instant)
         title_out = run([
@@ -130,6 +168,11 @@ def download_video(url, workdir):
         ], timeout=300)
     except Exception as e:
         log(f"yt-dlp download failed: {e}")
+        # Fallback: try direct curl download if we haven't already
+        if video_path is None:
+            video_path = download_direct_url(url, workdir)
+            if video_path:
+                return video_path, url.rsplit("/", 1)[-1].split("?")[0]
         return None, "Unknown"
 
     # Find the actual video file
@@ -309,13 +352,17 @@ def caption_segments_to_text(segments):
 
 
 def extract_audio(video_path, workdir):
-    """Extract audio to MP3 for transcription."""
+    """Extract audio for transcription. Returns path or None on failure."""
     audio_file = Path(workdir) / "audio.mp3"
-    run([
-        "ffmpeg", "-i", video_path, "-vn",
-        "-acodec", "libmp3lame", "-ar", "16000", "-ac", "1",
-        "-y", str(audio_file)
-    ], timeout=120)
+    try:
+        run([
+            "ffmpeg", "-i", video_path, "-vn",
+            "-acodec", "libmp3lame", "-ar", "16000", "-ac", "1",
+            "-y", str(audio_file)
+        ], timeout=120)
+    except Exception as e:
+        log(f"Audio extraction failed (video may have no audio track): {e}")
+        return None
     return str(audio_file) if audio_file.exists() else None
 
 
@@ -516,8 +563,20 @@ def main():
     log(f"Working directory: {workdir}")
 
     # Determine if URL or local file
-    is_url = args.source.startswith(("http://", "https://", "youtube.com", "youtu.be", "www."))
-    if is_url and not args.source.startswith("http"):
+    is_url = False
+    if args.source.startswith(("http://", "https://", "ftp://")):
+        is_url = True
+    elif "://" not in args.source and not os.path.exists(args.source):
+        # Not a local file and no protocol — might be a scheme-less URL or a missing file
+        if "." in args.source.replace("/", ""):
+            is_url = True
+            if not args.source.startswith("http"):
+                args.source = "https://" + args.source
+        else:
+            log(f"ERROR: '{args.source}' is neither a valid URL nor an existing file path")
+            sys.exit(1)
+
+    if is_url and not args.source.startswith(("http://", "https://", "ftp://")):
         args.source = "https://" + args.source
 
     video_path = None
@@ -549,16 +608,20 @@ def main():
         if not is_url or title == "Unknown":
             title = Path(video_path).name
 
-        # Extract captions (for URLs)
+        # Extract captions
         captions_file = None
         captions_text = ""
-        if is_url:
-            captions_file = extract_captions_ytdlp(args.source, workdir)
-        else:
-            # Check for sidecar caption files
+        # Try yt-dlp captions for both URLs and local files (yt-dlp can extract embedded subs from local files too)
+        try:
+            captions_file = extract_captions_ytdlp(args.source if is_url else video_path, workdir)
+        except Exception:
+            pass
+
+        if not captions_file and not is_url:
+            # Check for sidecar caption files alongside the local video file
             local_captions = list(Path(video_path).parent.glob(f"{Path(video_path).stem}.*"))
             for f in local_captions:
-                if f.suffix in (".vtt", ".srt", ".txt", ".scc", ".dfxp"):
+                if f.suffix in (".vtt", ".srt", ".txt", ".scc", ".dfxp", ".ass", ".ssa"):
                     captions_file = str(f)
                     break
 

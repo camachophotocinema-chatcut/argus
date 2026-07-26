@@ -1,7 +1,7 @@
 ---
 name: video-analysis
-version: "0.2.0"
-description: ARGUS — Analyze any video from a URL (YouTube, X, Vimeo, etc.) or local file — extracts scene-aware frames, gets captions, and sends everything to Gemini 3.5 Flash for timestamped analysis. Voice agent version of bradautomates/claude-video, powered by Gemini vision.
+version: "0.3.0"
+description: ARGUS — Analyze any video from any source: YouTube, X, Vimeo, direct MP4/WebM URLs, or local video files. Extracts scene-aware frames, pulls captions (yt-dlp or Gemini transcription), and sends everything to Gemini 3.5 Flash for timestamped analysis. Voice agent version of bradautomates/claude-video, powered by Gemini vision.
 argument-hint: "<video-url-or-path> [optional: question]"
 allowed-tools: Terminal, Read, VisionAnalyze
 related_skills: [youtube-content]
@@ -11,7 +11,12 @@ related_skills: [youtube-content]
 
 Named for the hundred-eyed giant of Greek myth — Argus Panoptes ("all-seeing"). Each extracted frame is another eye on the video.
 
-This skill gives your agent video vision. It downloads video (if URL), extracts frames at scene-aware intervals via ffmpeg, pulls captions (native yt-dlp subs, or Gemini-transcribed audio as fallback), and sends frames + captions to **Gemini 3.5 Flash** for a structured, timestamped analysis.
+This skill gives your agent video vision for **any video, from any source**. It can:
+- **Download** from YouTube, Twitter/X, Vimeo, TikTok, Instagram, Reddit, or any site yt-dlp supports
+- **Direct download** raw MP4/WebM/MOV/etc. URLs (`cdn.example.com/video.mp4`)
+- **Accept local files** you already have on disk (`/path/to/video.mp4`)
+
+Then it extracts frames at scene-aware intervals via ffmpeg, pulls captions (native yt-dlp subs, sidecar files, or Gemini-transcribed audio as fallback), and sends frames + captions to **Gemini 3.5 Flash** for a structured, timestamped analysis.
 
 ## Prerequisites
 
@@ -25,17 +30,23 @@ All verified working on macOS 26.5 (Apple Silicon).
 ## How it works
 
 ```
-User: "analyze this video" or provides a URL
+User: "analyze this video" or provides a URL / file path
   ↓
 Hermes loads this skill
   ↓
 Script: analyze_video.py
-  1. Downloads video via yt-dlp (or uses local file)
+  1. Gets the video:
+     - Streaming URLs (YouTube, X, Vimeo...): yt-dlp downloads
+     - Direct video URLs (.mp4, .webm, .mov...): curl downloads
+     - Local files (/path/to/video.mp4): used in-place
   2. Extracts scene-aware frames via ffmpeg scene detection
      - minimal:  30 frames max, scene-change triggered
      - balanced: 100 frames max, scene-aware + sparse fill (default)
      - detailed: 200 frames max, denser sampling
-  3. Gets captions via yt-dlp (auto-subs), or transcribes audio via Gemini 3.5 Flash
+  3. Gets captions:
+     ① yt-dlp (any platform with subs)
+     ② sidecar file (.vtt/.srt/.ass next to local video)
+     ③ Gemini 3.5 Flash transcription (fallback — extracts audio, transcribes)
   4. Sends ALL frames + captions to Gemini 3.5 Flash in a single multimodal request
   5. Returns structured JSON: analysis text + frame paths + captions
   ↓
@@ -60,6 +71,12 @@ python3 ~/.hermes/skills/video-analysis/scripts/analyze_video.py "https://youtu.
 
 ```bash
 python3 ~/.hermes/skills/video-analysis/scripts/analyze_video.py /path/to/video.mp4
+```
+
+### Direct video URL (raw mp4/webm)
+
+```bash
+python3 ~/.hermes/skills/video-analysis/scripts/analyze_video.py "https://cdn.example.com/video.mp4"
 ```
 
 ### Adjust frame density
@@ -157,6 +174,7 @@ If you hit input context limits:
 - **Audio transcription token cost** — 32 tok/sec is invisible but can dominate the budget on long videos. Prefer captions (yt-dlp) over Gemini transcription when available.
 - **No Groq Whisper** — if yt-dlp can't find captions, the script uses Gemini to transcribe audio, which is slower and more expensive. Set a Groq key for fast transcription with no context cost (Groq Whisper is external, not token-billed).
 - **Private videos** — yt-dlp can't download private/age-restricted videos without cookies. Pass the local file path instead.
+- **Direct URLs** — raw .mp4/.webm URLs download via curl. These are typically faster than yt-dlp but may lack metadata (title, duration detection may fail). Captions won't be available unless embedded or passed as a sidecar file.
 
 ## Recommended limits
 
