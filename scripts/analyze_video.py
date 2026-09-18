@@ -73,12 +73,69 @@ def get_video_duration(path):
     return float(out)
 
 
+def probe_video_stream(path):
+    """Read duration, native frame rate and frame count.
+
+    Argus must know the source frame rate to sample *relative to it*. Sampling by
+    wall-clock seconds alone is frame-rate blind: a 24fps film and a 30fps clip
+    both got 1 frame per second regardless of how much motion sits between them.
+    """
+    out = run([
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries",
+        "stream=r_frame_rate,avg_frame_rate,nb_frames,width,height:format=duration",
+        "-of", "default=noprint_wrappers=1", path,
+    ], timeout=30)
+
+    vals = {}
+    for line in (out or "").splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            vals[k.strip()] = v.strip()
+
+    def _rate(s):
+        try:
+            if "/" in s:
+                num, den = s.split("/")
+                return float(num) / float(den) if float(den) else 0.0
+            return float(s)
+        except Exception:
+            return 0.0
+
+    def _int(s):
+        try:
+            return int(s)
+        except Exception:
+            return 0
+
+    fps = _rate(vals.get("r_frame_rate", "")) or _rate(vals.get("avg_frame_rate", ""))
+    try:
+        duration = float(vals.get("duration") or 0)
+    except Exception:
+        duration = 0.0
+    if not duration:
+        try:
+            duration = get_video_duration(path)
+        except Exception:
+            duration = 0.0
+
+    return {
+        "duration": duration,
+        "fps": round(fps, 3),
+        "nb_frames": _int(vals.get("nb_frames")),
+        "width": _int(vals.get("width")),
+        "height": _int(vals.get("height")),
+    }
+
+
 def extract_captions_ytdlp(url, workdir):
     """Extract captions via yt-dlp. Returns path to caption file or None."""
     log("Extracting captions via yt-dlp...")
+    # Same 403 workaround as download_video: default clients are blocked.
+    YT_ARGS = ["--extractor-args", "youtube:player_client=android"]
     try:
         out = run([
-            "yt-dlp", "--write-auto-subs", "--sub-langs", "en,en-US,en-GB",
+            "yt-dlp", *YT_ARGS, "--write-auto-subs", "--sub-langs", "en,en-US,en-GB",
             "--skip-download", "--sub-format", "vtt",
             "-o", f"{workdir}/%(id)s.%(ext)s",
             url
@@ -93,7 +150,7 @@ def extract_captions_ytdlp(url, workdir):
 
         # Try alternative: write-subs (not auto)
         out = run([
-            "yt-dlp", "--write-subs", "--sub-langs", "en,en-US,en-GB",
+            "yt-dlp", *YT_ARGS, "--write-subs", "--sub-langs", "en,en-US,en-GB",
             "--skip-download", "--sub-format", "vtt",
             "-o", f"{workdir}/%(id)s.%(ext)s",
             url
@@ -142,6 +199,12 @@ def download_video(url, workdir):
     """Download video via yt-dlp (or fall back to curl for direct URLs). Returns path to video file and metadata."""
     log("Downloading video...")
 
+    # YouTube blocks yt-dlp's default player clients with HTTP 403. The `android`
+    # client still serves media as of this writing; `mweb` also works. Without this
+    # every YouTube URL fails at ffprobe with "moov atom not found" because the
+    # download silently produced an error page instead of a video.
+    YT_ARGS = ["--extractor-args", "youtube:player_client=android"]
+
     # Try direct download first for obvious video-file URLs (fast, no yt-dlp overhead)
     video_path = None
     title = "Unknown"
@@ -155,13 +218,14 @@ def download_video(url, workdir):
     try:
         # Get title first (metadata only, instant)
         title_out = run([
-            "yt-dlp", "--print", "title", "--skip-download", url
+            "yt-dlp", *YT_ARGS, "--print", "title", "--skip-download", url
         ], timeout=30)
         title = title_out.strip() or "Unknown"
 
         # Then download the video
         run([
-            "yt-dlp", "-f", "bestvideo*[height<=1080]+bestaudio/best[height<=1080]",
+            "yt-dlp", *YT_ARGS,
+            "-f", "bestvideo*[height<=1080]+bestaudio/best[height<=1080]",
             "--merge-output-format", "mp4",
             "-o", f"{workdir}/video.%(ext)s",
             url
@@ -209,85 +273,94 @@ def download_video_limited(url, workdir, start_sec=0, end_sec=None):
         return None
 
 
-def extract_frames_ffmpeg(video_path, workdir, mode="balanced", max_frames=None):
+def extract_frames_ffmpeg(video_path, workdir, mode="balanced", max_frames=None,
+                          target_fps=None):
     """
-    Extract frames at scene-aware intervals using ffmpeg scene detection.
+    Extract frames on a density grid measured in frames-per-second.
 
-    Modes:
-      - minimal: 1 frame per scene change (cap 30)
-      - balanced: scene-aware, sparse within long scenes (cap 100, default)
-      - detailed: scene-aware, denser sampling (cap 200)
+    Modes set the target rate, not a raw count:
+      - minimal:  1 fps  — summaries of talking-head/tutorial content
+      - balanced: 4 fps  — default; enough to read motion
+      - detailed: 8 fps  — craft review: animation quality, physical continuity
 
-    Returns list of (timestamp_sec, frame_path) tuples.
+    Why fps and not a frame cap: the previous version derived
+    `interval = max(1, int(duration / max))`, whose floor of one second silently
+    capped sampling at 1 fps for EVERY video and made the 30/100/200 caps inert
+    for anything under ~30s. It also never read the source frame rate, so a 24fps
+    film and a 30fps clip were sampled identically by wall clock. Sampling density
+    is now expressed relative to the source rate and clamped to it.
+
+    Returns (frames, duration, meta) where frames is a list of (timestamp_sec, path).
     """
     log(f"Extracting frames ({mode} mode)...")
 
     frames_dir = Path(workdir) / "frames"
     frames_dir.mkdir(exist_ok=True)
 
-    # Mode config
-    configs = {
-        "minimal": {"scene_threshold": 0.3, "max": 30, "min_interval": 5},
-        "balanced": {"scene_threshold": 0.3, "max": 100, "min_interval": 2},
-        "detailed": {"scene_threshold": 0.4, "max": 200, "min_interval": 1},
-    }
-    cfg = configs.get(mode, configs["balanced"])
-    if max_frames:
-        cfg["max"] = max_frames
+    FPS_PRESETS = {"minimal": 1.0, "balanced": 4.0, "detailed": 8.0}
 
-    duration = get_video_duration(video_path)
-    log(f"Video duration: {duration:.1f}s")
+    src = probe_video_stream(video_path)
+    duration = src["duration"]
+    native_fps = src["fps"] or 0.0
+    log(f"Source: {duration:.2f}s @ {native_fps or '?'} fps "
+        f"({src['nb_frames'] or '?'} frames, {src['width']}x{src['height']})")
 
-    # Step 1: Run ffmpeg scene detection to find shot boundaries
+    want_fps = float(target_fps) if target_fps else FPS_PRESETS.get(mode, 4.0)
+    if native_fps and want_fps > native_fps:
+        log(f"Requested {want_fps:g} fps exceeds source {native_fps:g} fps — clamping")
+        want_fps = native_fps
+
+    # Dense uniform grid at the requested rate (sub-second resolution)
+    step = 1.0 / want_fps if want_fps else 1.0
+    n = int(duration * want_fps) if duration and want_fps else 0
+    times = [round(i * step, 3) for i in range(n)]
+
+    # Union in scene cuts so shot boundaries can never be skipped
     log("Running scene detection...")
     try:
         scene_out = run([
             "ffmpeg", "-i", video_path,
-            "-filter:v", f"select='gt(scene,{cfg['scene_threshold']})',showinfo",
+            "-filter:v", "select='gt(scene,0.3)',showinfo",
             "-f", "null", "-",
         ], timeout=120, check=False)
     except Exception as e:
         log(f"Scene detection failed: {e}")
         scene_out = ""
 
-    # Parse scene detection output for timestamps
-    scene_times = [0.0]  # Always include first frame
-    for match in re.finditer(r"pts_time:([\d.]+)", scene_out):
-        ts = float(match.group(1))
-        if ts > 0 and ts < duration:
-            scene_times.append(ts)
-
-    # If scene detection found nothing useful, fall back to uniform sampling
-    if len(scene_times) <= 1:
-        log("Scene detection found no cuts, falling back to uniform sampling")
-        interval = max(1, int(duration / cfg["max"]))
-        scene_times = list(range(0, int(duration), max(interval, 1)))
+    cuts = [round(float(m), 3) for m in re.findall(r"pts_time:([\d.]+)", scene_out or "")]
+    cuts = sorted({t for t in cuts if 0 < t < duration})
+    if cuts:
+        times = sorted(set(times) | set(cuts))
+        log(f"Scene detection: {len(cuts)} cuts merged into the grid")
     else:
-        # Filter scene times by min_interval to avoid too-dense frames
-        filtered = [0.0]
-        for t in sorted(scene_times):
-            if t - filtered[-1] >= cfg["min_interval"]:
-                filtered.append(t)
-        scene_times = filtered
+        log("Scene detection found no cuts — uniform grid only")
 
-    # Cap at max_frames
-    if len(scene_times) > cfg["max"]:
-        # Sample evenly from the scene list
-        indices = [int(i * len(scene_times) / cfg["max"]) for i in range(cfg["max"])]
-        scene_times = [scene_times[i] for i in indices]
+    # Cap, preserving even coverage
+    capped = False
+    if max_frames and len(times) > max_frames:
+        idx = [int(i * len(times) / max_frames) for i in range(max_frames)]
+        times = [times[i] for i in idx]
+        capped = True
 
-    log(f"Extracting {len(scene_times)} frames...")
+    effective_fps = (len(times) / duration) if duration else 0.0
+    method = f"uniform {want_fps:g}fps grid"
+    method += f" + {len(cuts)} scene cuts" if cuts else " (no cuts detected)"
+    if capped:
+        method += f", capped at {max_frames}"
+
+    log(f"Extracting {len(times)} frames ({method})")
 
     # Step 2: Extract each frame
     frames = []
-    for i, ts in enumerate(scene_times):
+    for i, ts in enumerate(times):
         if ts >= duration:
             continue
-        frame_file = frames_dir / f"frame_{i:04d}_{int(ts)}.jpg"
+        # millisecond precision — int(ts) collided for sub-second timestamps
+        frame_file = frames_dir / f"frame_{i:05d}_{int(round(ts * 1000)):08d}ms.jpg"
         if not frame_file.exists():
             try:
                 run([
-                    "ffmpeg", "-ss", str(ts), "-i", video_path,
+                    "ffmpeg", "-ss", f"{ts:.3f}", "-i", video_path,
                     "-vframes", "1", "-q:v", "3",
                     "-y", str(frame_file)
                 ], timeout=30, check=False)
@@ -295,8 +368,20 @@ def extract_frames_ffmpeg(video_path, workdir, mode="balanced", max_frames=None)
                 continue
         frames.append((ts, str(frame_file)))
 
-    log(f"Extracted {len(frames)} frames")
-    return frames, duration
+    coverage = (100.0 * len(frames) / src["nb_frames"]) if src["nb_frames"] else None
+    meta = {
+        "source_fps": native_fps,
+        "source_frames": src["nb_frames"],
+        "source_resolution": f"{src['width']}x{src['height']}",
+        "target_fps": want_fps,
+        "effective_fps": round(effective_fps, 2),
+        "scene_cuts": len(cuts),
+        "coverage_pct": round(coverage, 1) if coverage is not None else None,
+        "method": method,
+    }
+    log(f"Extracted {len(frames)} frames "
+        f"({meta['effective_fps']} fps, {coverage and round(coverage,1)}% of source frames)")
+    return frames, duration, meta
 
 
 def parse_captions_vtt(vtt_path):
@@ -381,7 +466,7 @@ def transcribe_with_gemini(audio_path, workdir, api_key):
             "role": "user",
             "content": [
                 {"type": "text", "text": "Transcribe this audio verbatim. Include timestamps in [HH:MM:SS] format at each sentence. Output only the transcript, no preamble."},
-                {"type": "audio", "audio_url": f"data:audio/mpeg;base64,{audio_b64}"}
+                {"type": "input_audio", "input_audio": {"data": audio_b64, "format": "mp3"}}
             ]
         }],
         "max_tokens": 4096,
@@ -411,14 +496,25 @@ def transcribe_with_gemini(audio_path, workdir, api_key):
         transcript_file = Path(workdir) / "transcript.txt"
         transcript_file.write_text(transcript)
         return str(transcript_file), transcript
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()
+        log(f"Gemini transcription failed: HTTP {e.code} {body[:300]}")
+        return None, ""
     except Exception as e:
-        log(f"Gemini transcription failed: {e}")
+        log(f"Gemini transcription failed: {type(e).__name__}: {e}")
         return None, ""
 
 
-def analyze_frames_with_gemini(frames, captions_text, title, duration, api_key, mode="balanced"):
+def analyze_frames_with_gemini(frames, captions_text, title, duration, api_key, mode="balanced", question=None, audio_path=None):
     """
-    Send all extracted frames + captions to Gemini 3.5 Flash for analysis.
+    Send all extracted frames + captions + (when present) the audio track to
+    Gemini 3.5 Flash for analysis.
+
+    The audio track matters: a text transcript carries only *speech*. On a
+    no-dialogue ASMR / score-driven piece the transcript is empty, which
+    previously left sound design — often the whole point of the short —
+    structurally invisible to the model. Gemini ingests audio natively, so the
+    waveform is attached directly.
 
     Uses the OpenAI-compatible endpoint of Gemini API.
     """
@@ -430,20 +526,30 @@ def analyze_frames_with_gemini(frames, captions_text, title, duration, api_key, 
     content_parts = []
 
     # System-like instruction as first text
-    content_parts.append({
-        "type": "text",
-        "text": (
-            "You are analyzing a video frame-by-frame. Below are timestamped frames "
-            "extracted at scene-aware intervals, plus caption text.\n\n"
-            "For each major section or timestamp cluster, provide:\n"
-            "1. **Timestamp** — when this section occurs\n"
-            "2. **What's on screen** — describe the visual content (UI, code, people, etc.)\n"
-            "3. **What's being said** — key points from the captions at this time\n"
-            "4. **Key takeaway** — one-line substance, stripped of hype\n\n"
-            "End with an overall summary (3-5 bullet points) that a busy person can read "
-            "in 30 seconds. Be concise and specific."
+    instruction = (
+        "You are analyzing a video from timestamped frames"
+        + (", its audio track," if audio_path else "")
+        + " and caption text.\n\n"
+    )
+    if question:
+        instruction += (
+            "**Answer this question as your primary task, citing a timestamp for every "
+            "claim:**\n" + question + "\n\n"
+            "Ground every statement in what the frames actually show. If the frames do not "
+            "support a claim, say so instead of inferring it. Call out defects, artefacts "
+            "and anything that looks wrong plainly and specifically. Only then summarise "
+            "what happens in the video.\n\n"
         )
-    })
+    instruction += (
+        "For each major section or timestamp cluster, provide:\n"
+        "1. **Timestamp** — when this section occurs\n"
+        "2. **What's on screen** — describe the visual content (UI, code, people, etc.)\n"
+        "3. **What's being said** — key points from the captions at this time\n"
+        "4. **Key takeaway** — one-line substance, stripped of hype\n\n"
+        "End with an overall summary (3-5 bullet points) that a busy person can read "
+        "in 30 seconds. Be concise and specific."
+    )
+    content_parts.append({"type": "text", "text": instruction})
 
     # Add context
     ctx = f"Title: {title}\nDuration: {duration:.1f}s\nAnalysis mode: {mode}\n\n"
@@ -476,14 +582,35 @@ def analyze_frames_with_gemini(frames, captions_text, title, duration, api_key, 
     else:
         content_parts.append({
             "type": "text",
-            "text": "\n\nNo captions available. Rely on visual frame analysis only."
+            "text": ("\n\nNo speech transcript available. "
+                     + ("Describe the sound design from the attached audio track."
+                        if audio_path else "Rely on visual frame analysis only."))
         })
+
+    # Attach the audio track itself, not just a transcript. A transcript carries
+    # only speech — on a no-dialogue ASMR/score piece it is empty, which left the
+    # sound design invisible to the model.
+    if audio_path and os.path.exists(audio_path):
+        try:
+            audio_b64 = base64.b64encode(Path(audio_path).read_bytes()).decode()
+            # The Gemini OpenAI-compatible endpoint takes OpenAI's `input_audio`
+            # shape. The previously used {"type":"audio","audio_url":...} is
+            # rejected with 400 "Invalid content part type: audio".
+            fmt = Path(audio_path).suffix.lstrip(".").lower() or "mp3"
+            content_parts.append({"type": "text", "text": "\n\n--- Audio track (full) ---"})
+            content_parts.append({
+                "type": "input_audio",
+                "input_audio": {"data": audio_b64, "format": fmt},
+            })
+            log(f"Attached the audio track to the analysis request ({fmt})")
+        except Exception as e:
+            log(f"Failed to attach audio track: {e}")
 
     # Send to Gemini
     payload = {
         "model": "gemini-3.5-flash",
         "messages": [{"role": "user", "content": content_parts}],
-        "max_tokens": 8192,
+        "max_tokens": 32768,
         "temperature": 0.3,
     }
 
@@ -540,6 +667,8 @@ def get_api_key():
 def main():
     parser = argparse.ArgumentParser(description="Analyze a video via Gemini 3.5 Flash")
     parser.add_argument("source", help="YouTube URL or local video file path")
+    parser.add_argument("question", nargs="?", default=None,
+                        help="Optional question to focus the analysis on")
     parser.add_argument("--mode", choices=["minimal", "balanced", "detailed"],
                         default="balanced", help="Frame extraction density")
     parser.add_argument("--start", help="Start timestamp (MM:SS or HH:MM:SS)")
@@ -547,9 +676,15 @@ def main():
     parser.add_argument("--output", help="Output JSON file path")
     parser.add_argument("--keep-frames", action="store_true",
                         help="Keep extracted frames after analysis")
-    parser.add_argument("--max-frames", type=int, help="Override max frame count")
+    parser.add_argument("--max-frames", type=int, help="Cap on frames sent to the model")
+    parser.add_argument("--fps", type=float, dest="fps",
+                        help="Sample density in frames-per-second (overrides the mode preset; "
+                             "clamped to the source frame rate). Use 4-8 for craft review.")
     parser.add_argument("--no-vision", action="store_true",
                         help="Skip vision analysis, only extract frames and captions")
+    parser.add_argument("--no-audio", action="store_true",
+                        help="Do not extract or attach the audio track (frames + transcript only). "
+                             "Leave this off for ASMR/music-driven pieces.")
     args = parser.parse_args()
 
     # Get API key
@@ -625,6 +760,13 @@ def main():
                     captions_file = str(f)
                     break
 
+        # Extract the audio track once. It serves two purposes: transcription when
+        # there are no captions, and direct attachment to the analysis request so
+        # sound design is analysable (a transcript carries only speech).
+        audio_file = None if args.no_audio else extract_audio(video_path, workdir)
+        if not audio_file:
+            log("No audio track available (or --no-audio)")
+
         if captions_file:
             segments = parse_captions_vtt(captions_file)
             captions_text = caption_segments_to_text(segments)
@@ -632,23 +774,33 @@ def main():
             log(f"Got {len(segments)} caption segments from {captions_file}")
         else:
             log("No captions available, transcribing audio via Gemini...")
-            audio_file = extract_audio(video_path, workdir)
             if audio_file:
                 captions_file, captions_text = transcribe_with_gemini(audio_file, workdir, api_key)
-                caption_source = "gemini-transcribe"
+                # Be honest about which of three things happened — the old code
+                # reported "gemini-transcribe" even when the call had failed.
+                if captions_file is None:
+                    caption_source = "transcribe-error"
+                    log("Transcription FAILED (API error) — no transcript available")
+                elif captions_text.strip():
+                    caption_source = "gemini-transcribe"
+                else:
+                    caption_source = "no-speech"
+                    log("Transcription succeeded but found no speech (music/ASMR-only audio)")
             else:
                 caption_source = "none"
 
-        # Extract frames
+        # Extract frames. Caps are a token guard for long sources — for shorts the
+        # density preset governs, and meta reports whether the cap actually bound.
         if args.mode == "minimal":
-            max_frames = args.max_frames or 30
+            max_frames = args.max_frames or 60
         elif args.mode == "detailed":
-            max_frames = args.max_frames or 200
+            max_frames = args.max_frames or 600
         else:
-            max_frames = args.max_frames or 100
+            max_frames = args.max_frames or 300
 
-        frames, duration = extract_frames_ffmpeg(
-            video_path, workdir, mode=args.mode, max_frames=max_frames
+        frames, duration, frame_meta = extract_frames_ffmpeg(
+            video_path, workdir, mode=args.mode, max_frames=max_frames,
+            target_fps=getattr(args, "fps", None),
         )
 
         if not frames:
@@ -662,7 +814,8 @@ def main():
                 "title": title,
                 "duration_sec": duration,
                 "frame_count": len(frames),
-                "frame_extraction": "scene-aware",
+                "frame_extraction": frame_meta["method"],
+                "frame_sampling": frame_meta,
                 "caption_source": caption_source,
                 "frames_dir": str(Path(workdir) / "frames"),
                 "caption_file": captions_file,
@@ -674,7 +827,8 @@ def main():
 
         # Send to Gemini for analysis
         analysis = analyze_frames_with_gemini(
-            frames, captions_text, title, duration, api_key, args.mode
+            frames, captions_text, title, duration, api_key, args.mode, args.question,
+            audio_path=audio_file,
         )
 
         # Build output
@@ -683,8 +837,10 @@ def main():
             "title": title,
             "duration_sec": duration,
             "frame_count": len(frames),
-            "frame_extraction": "scene-aware (ffmpeg scene detection)",
+            "frame_extraction": frame_meta["method"],
+            "frame_sampling": frame_meta,
             "caption_source": caption_source,
+            "audio_attached": bool(audio_file),
             "analysis": analysis,
             "frames_dir": str(Path(workdir) / "frames"),
             "caption_file": captions_file,

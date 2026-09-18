@@ -1,15 +1,15 @@
 ---
 name: video-analysis
-version: "0.3.0"
-description: ARGUS — Analyze any video from any source: YouTube, X, Vimeo, direct MP4/WebM URLs, or local video files. Extracts scene-aware frames, pulls captions (yt-dlp or Gemini transcription), and sends everything to Gemini 3.5 Flash for timestamped analysis. Voice agent version of bradautomates/claude-video, powered by Gemini vision.
+version: "0.4.0"
+description: "ARGUS -- Analyze any video from any source. YouTube, X, Vimeo, direct MP4/WebM URLs, or local video files. Samples frames by density in frames-per-second (frame-rate aware: 24/30/60fps), attaches the audio track for sound-design analysis, and sends everything to Gemini 3.5 Flash for timestamped analysis."
 argument-hint: "<video-url-or-path> [optional: question]"
 allowed-tools: Terminal, Read, VisionAnalyze
 related_skills: [youtube-content]
 ---
 
-# Argus — Video Analysis (Hermes / Gemini-powered)
+# Argus -- Video Analysis (Hermes / Gemini-powered)
 
-Named for the hundred-eyed giant of Greek myth — Argus Panoptes ("all-seeing"). Each extracted frame is another eye on the video.
+Named for the hundred-eyed giant of Greek myth -- Argus Panoptes ("all-seeing"). Each extracted frame is another eye on the video.
 
 This skill gives your agent video vision for **any video, from any source**. It can:
 - **Download** from YouTube, Twitter/X, Vimeo, TikTok, Instagram, Reddit, or any site yt-dlp supports
@@ -20,12 +20,88 @@ Then it extracts frames at scene-aware intervals via ffmpeg, pulls captions (nat
 
 ## Prerequisites
 
-- **ffmpeg** — installed (`/Users/javiercamacho/.local/bin/ffmpeg`)
-- **yt-dlp** — installed via brew (`/opt/homebrew/bin/yt-dlp`)
-- **GOOGLE_API_KEY** — set in `~/.hermes/.env` (already configured)
-- **Groq key** — NOT configured; audio transcription falls back to Gemini 3.5 Flash
+- **ffmpeg** — installed and on `PATH`
+- **yt-dlp** — installed via brew (`brew install yt-dlp`)
+- **GOOGLE_API_KEY** -- set in `~/.hermes/.env` (already configured)
+- **Groq key** -- NOT configured; audio transcription falls back to Gemini 3.5 Flash
 
-All verified working on macOS 26.5 (Apple Silicon).
+## Pitfall: 1 fps was a hard floor — and a raw frame cap cannot raise it
+
+The old sampler derived `interval = max(1, int(duration / max_frames))`. That `max(...,1)`
+clamped the interval to **one second**, so sampling could never exceed **1 fps on any
+video in any mode**, and the 30/100/200 caps were inert for anything under ~30s. It also
+never read the source frame rate, so a 24fps film and a 30fps clip were sampled
+identically by wall clock — `--mode detailed --max-frames 200` on a 30s short still
+yielded exactly 30 frames.
+
+Why this matters: at 1 fps every claim the model makes about *motion* is fabricated. It
+reported four "AI artifacts" on a polished 30s short — a "gelatinous" sauce flip, morphing
+garlic, a rigid oil stream — all of which were single-frame guesses about action it could
+not see. Re-run at 8 fps on the same file with the audio attached, the verdict reversed to
+"exceptionally polished… no rendering artifacts visible in any of the frames".
+
+If a report ever claims defects, **check `frame_sampling` first**: if `effective_fps` is
+near 1, or `coverage_pct` is single digits, the report is describing a slideshow, not a film.
+
+## Pitfall: the report used to lie about its own method — do not trust a bare label
+
+`frame_extraction` was hardcoded to `"scene-aware (ffmpeg scene detection)"` **even when the
+scene detector found nothing and the code had fallen back to blind uniform sampling**. It now
+reports the method that actually ran (`uniform 8fps grid (no cuts detected)`). Same family of
+bug in `caption_source`, which reported `gemini-transcribe` even when the transcription call had
+failed and returned empty, and in the audio part, which used a shape the endpoint rejects — so
+**audio transcription had never worked**, and every run implied it had. Labels now distinguish
+`gemini-transcribe` / `no-speech` / `transcribe-error` / `none`.
+
+General rule for this script: when a field describes *how* something was produced, it must be
+derived from what actually happened, not asserted. An absent signal is not a pass.
+
+## Pitfall: Gemini's OpenAI-compatible endpoint rejects `{"type":"audio"}`
+
+Audio content parts use OpenAI's shape. This is rejected with HTTP 400
+`Invalid content part type: audio`:
+
+```json
+{"type": "audio", "audio_url": "data:audio/mpeg;base64,..."}   // ✗ 400
+```
+
+These work (verified against `/v1beta/openai/chat/completions`):
+
+```json
+{"type": "input_audio", "input_audio": {"data": "<base64>", "format": "mp3"}}   // ✓
+```
+
+Audio likely works via the native path too (`/v1beta/models/<model>:generateContent` with
+`inline_data`), but the OpenAI-compatible endpoint is what this script uses. Note `format`
+is a bare extension (`mp3`, `wav`), not a MIME type.
+
+## Cost of a dense run (measured)
+
+242 frames + a 30s audio track against `gemini-3.5-flash` = **271,631 prompt tokens**,
+1,424 completion tokens, ~64s wall time. Density is the cost driver, so reach for
+`--fps 8` on shorts and use `--start/--end` (or a pre-cut file) on long sources rather
+than raising the cap.
+
+## Pitfall: `--start/--end` may be ignored — verify `duration_sec` before trusting a scoped run
+
+`--start/--end` may be ignored; if `duration_sec` equals the full video, every citation is
+full-video and the report must say so. If you need a genuine window, cut it first with ffmpeg and
+pass the local file path.
+
+## Pitfall: YouTube returns HTTP 403 to yt-dlp's default player clients
+
+Symptom: download "succeeds" but then fails at `ffprobe` with `moov atom not found` /
+non-zero exit, because yt-dlp fetched an error page instead of media. The failure surfaces
+in `get_video_duration`, which makes it look like an ffprobe or file-format problem rather
+than an extraction problem -- that misdirection is the expensive part.
+
+Fix: force a player client that still serves media. The script passes
+`--extractor-args "youtube:player_client=android"` on every yt-dlp call (download, title,
+and both caption paths). As of this writing `android` and `mweb` work; `ios`, `tv`,
+`web_safari`, and `tv_embedded` all 403.
+
+If YouTube breaks again, swap the client name rather than debugging the video pipeline --
+and apply it to *all* yt-dlp calls in the script, not just the download, or captions still fail.
 
 ## How it works
 
@@ -39,15 +115,18 @@ Script: analyze_video.py
      - Streaming URLs (YouTube, X, Vimeo...): yt-dlp downloads
      - Direct video URLs (.mp4, .webm, .mov...): curl downloads
      - Local files (/path/to/video.mp4): used in-place
-  2. Extracts scene-aware frames via ffmpeg scene detection
-     - minimal:  30 frames max, scene-change triggered
-     - balanced: 100 frames max, scene-aware + sparse fill (default)
-     - detailed: 200 frames max, denser sampling
+  2. Extracts frames on a density grid measured in frames-per-second
+     - minimal:  1 fps  — talking-head/tutorial summaries only
+     - balanced: 4 fps  — default (cap 300)
+     - detailed: 8 fps  — craft review (cap 600)
+     - `--fps N` overrides; clamped to the source frame rate
+     - scene cuts are merged into the grid so shot boundaries are never skipped
   3. Gets captions:
      ① yt-dlp (any platform with subs)
      ② sidecar file (.vtt/.srt/.ass next to local video)
-     ③ Gemini 3.5 Flash transcription (fallback — extracts audio, transcribes)
-  4. Sends ALL frames + captions to Gemini 3.5 Flash in a single multimodal request
+     ③ Gemini 3.5 Flash transcription (fallback -- extracts audio, transcribes)
+  4. Sends ALL frames + captions + the audio track to Gemini 3.5 Flash in a single
+     multimodal request
   5. Returns structured JSON: analysis text + frame paths + captions
   ↓
 Agent: reads the analysis, presents to user with timestamps
@@ -55,11 +134,25 @@ Agent: reads the analysis, presents to user with timestamps
 
 ## Usage
 
-### Basic — analyze a YouTube video
+### Basic -- analyze a YouTube video
 
 ```bash
 python3 ~/.hermes/skills/video-analysis/scripts/analyze_video.py "https://youtube.com/watch?v=..."
 ```
+
+### Ask a specific question (strongly preferred for diagnosis)
+
+Pass a question as the second positional argument. It becomes the primary task and the
+model is told to cite a timestamp per claim and to flag defects rather than infer:
+
+```bash
+python3 ~/.hermes/skills/video-analysis/scripts/analyze_video.py /path/to/clip.mp4 \
+  "Does the subject's anatomy stay consistent as the camera pulls back? Describe any distortion, deformation or artifact, with timestamps." \
+  --mode detailed --output /tmp/review.json
+```
+
+Use this whenever you are reviewing your own output rather than summarising someone
+else's video.
 
 ### Analyze a section (faster for long videos)
 
@@ -79,19 +172,52 @@ python3 ~/.hermes/skills/video-analysis/scripts/analyze_video.py /path/to/video.
 python3 ~/.hermes/skills/video-analysis/scripts/analyze_video.py "https://cdn.example.com/video.mp4"
 ```
 
-### Adjust frame density
+### X/Twitter attached video
 
 ```bash
-# Minimal (30 frames max) — fast, good for 2-3 min videos
-python3 ~/.hermes/skills/video-analysis/scripts/analyze_video.py "URL" --mode minimal
+# 1fps summary of what happens
+python3 ~/.hermes/skills/video-analysis/scripts/analyze_video.py "https://x.com/User/status/<tweet_id>/video/1" --mode minimal
 
-# Detailed (200 frames max) — max fidelity, high Gemini token cost
-python3 ~/.hermes/skills/video-analysis/scripts/analyze_video.py "URL" --mode detailed
+# craft review of a short -- use this for anything you are judging the quality of
+python3 ~/.hermes/skills/video-analysis/scripts/analyze_video.py "https://x.com/User/status/<tweet_id>/video/1" --fps 8
 ```
 
-### Extract only (no vision analysis)
+No auth needed — yt-dlp resolves X video URLs. For tweet text, media metadata, and login-gated X-article handling, see `references/x-twitter-extraction.md` (syndication API + twitter-cli articleText path).
 
-Use this when you just want frames + captions as files:
+### Adjust sampling density (use `--fps`)
+
+Sampling is expressed in **frames per second**, not a raw frame count. Presets:
+`minimal` 1 fps · `balanced` 4 fps · `detailed` 8 fps. Override the preset with `--fps`
+(clamped to the source rate — you cannot sample more frames than exist).
+
+```bash
+# 8 fps -- craft review: animation quality, physical continuity, motion
+python3 ~/.hermes/skills/video-analysis/scripts/analyze_video.py "URL" --mode detailed
+
+# explicit rate (a 30s short at 8fps = ~240 frames)
+python3 ~/.hermes/skills/video-analysis/scripts/analyze_video.py "URL" --fps 8
+
+# 1 fps -- summaries of talking-head/tutorial content ONLY
+python3 ~/.hermes/skills/video-analysis/scripts/analyze_video.py "URL" --mode minimal
+```
+
+**Choose the mode by what you are asking.** `minimal` answers "what happens in this
+video". It cannot answer "is this well made" — at 1 fps you get 30 frames of a 30s
+short and **no motion information at all**. Judge craft at `detailed`/`--fps 6-8`.
+
+Every run reports `frame_sampling` (source fps, source frames, target/effective fps,
+scene cuts, % of source frames covered) and the true `frame_extraction` method, so
+the report states its own sampling density rather than implying it saw everything.
+
+### Audio is attached to the analysis, not just transcribed
+
+The audio track is sent to the model **as audio** alongside the frames. A transcript
+carries only *speech* — on a music/ASMR/no-dialogue piece it is empty, which leaves
+sound design unanalysable. With the audio attached the model reports specific,
+timestamped sound events (foley, score swells, silence beats) against the picture.
+Use `--no-audio` only when you deliberately want frames + transcript only.
+
+### Extract only (no vision analysis)
 
 ```bash
 python3 ~/.hermes/skills/video-analysis/scripts/analyze_video.py "URL" --no-vision --keep-frames
@@ -103,12 +229,66 @@ python3 ~/.hermes/skills/video-analysis/scripts/analyze_video.py "URL" --no-visi
 python3 ~/.hermes/skills/video-analysis/scripts/analyze_video.py "URL" --output /tmp/video-analysis.json
 ```
 
+### Cost discipline (parent-context bloat)
+
+A full Argus run returns multi-thousand-token JSON. Do NOT dump it inline into the parent
+thread — the parent re-reads its whole context on every subsequent tool call, so a few inline
+Argus dumps balloon the session's token cost (measured: ~331M cache-read tokens ≈ $7 in one
+long session). Two ways to keep the parent lean:
+
+- Always pass `--output <file>`, then read only the `analysis` field: `jq -r '.analysis' <file>`.
+- When the run is one step in a larger task, delegate it to a subagent (isolated context) so
+  only a short summary returns to the parent.
+
 ## Workflow for the Hermes agent
 
-1. **Identify the source** — user provides a URL or local file path
-2. **Run the script** — use `terminal()` to call the script with appropriate flags
-3. **Read the JSON output** — the analysis text is in the `analysis` field
-4. **Present to user** — structure includes timestamped frame descriptions, transcript highlights, and an overall summary
+1. **Identify the source** -- user provides a URL or local file path
+2. **Run the script** -- use `terminal()` to call the script with appropriate flags
+3. **Read the JSON output** -- the analysis text is in the `analysis` field
+4. **Present to user** -- structure includes timestamped frame descriptions, transcript highlights, and an overall summary
+
+## Reviewing STILLS and storyboards (frames that were never a video)
+
+Argus is the right instrument for checking a set of stills against each other — storyboard frames, plate
+sets, generated images that must be consistent. **Do not review them one at a time.** A per-image vision
+pass sees a single frame with no shared context: it cannot see what happens *between* frames, and it
+describes small objects inconsistently from frame to frame. Observed twice on the same set: two isolated
+passes returned **opposite** verdicts about a telephone's keypad, and eight isolated passes missed a
+day/night break, a colour change in a prop, and two frames that were supposed to be the same physical
+object and were not.
+
+The method is to turn the stills into a sequence and hand the whole thing over in one request:
+
+```sh
+# concat the frames in intended order, ~2.5s each, then analyse the result
+# (build a concat list of 'file <path>' + 'duration 2.5' per frame, last file repeated)
+ffmpeg -y -f concat -safe 0 -i list.txt -vf scale=1600:-2,setsar=1 -r 4 \
+  -pix_fmt yuv420p -c:v libx264 -crf 20 sequence.mp4
+
+python3 scripts/analyze_video.py sequence.mp4 "<continuity brief>" --mode detailed --output out.json
+```
+
+**Put a frame manifest in the question** — number, filename and a one-line description of each frame — so
+the model can cite frames by name rather than by timestamp. Ask it explicitly to check:
+
+- **object continuity** (is the phone/chair/document the same physical object in every frame?)
+- **character continuity** (wardrobe, hair, eyewear, badges, and props they are holding)
+- **room and lighting continuity** (time of day, architecture, window content)
+- **artifact continuity** (is chart B the same sheet of paper as chart A — same corner curl, grid, line style?)
+
+and to **flag defects rather than infer**, and to answer "cannot be determined" when a check is not
+possible instead of guessing.
+
+Two quirks when the input is a slideshow rather than footage:
+
+- `Scene detection found no cuts, falling back to uniform sampling` is **expected** — hard cuts between
+  stills often fall below the scene threshold. Uniform sampling is fine; you get ~2-3 frames per slide.
+- There is no audio, so captions come back `none`. That is not an error.
+
+**Settle object continuity by construction, not by analysis.** When two instruments disagree about a small
+object, do not arbitrate between them: lock one canonical instance as an **image reference** and regenerate
+every frame containing that object against it. Attaching the canonical frame as a reference image makes the
+objects the same by construction, which is more reliable than any reviewer's verdict.
 
 ## Frame extraction details
 
@@ -117,6 +297,10 @@ python3 ~/.hermes/skills/video-analysis/scripts/analyze_video.py "URL" --output 
 - Frames are JPEG at quality 3 (~120-200KB each)
 - Extracted frames + captions are deleted after analysis unless `--keep-frames`
 
+## Download pipeline
+
+See `references/download-pipeline.md` for the three download strategies (curl, yt-dlp, local), caption resolution order, and audio edge cases.
+
 ## Dependencies
 
 | Tool | Status | Purpose |
@@ -124,41 +308,18 @@ python3 ~/.hermes/skills/video-analysis/scripts/analyze_video.py "URL" --output 
 | ffmpeg 8.1.2 | ✓ installed | Frame extraction, audio extraction, scene detection |
 | yt-dlp | ✓ installed (brew) | Video download, caption extraction |
 | Gemini 3.5 Flash | ✓ API key set | Vision + optional audio transcription |
-| Groq Whisper | ✗ (no key) | Unavailable — audio transcription uses Gemini instead |
+| Groq Whisper | ✗ (no key) | Unavailable -- audio transcription uses Gemini instead |
 
 ## Token Budget (Critical)
-
-Confirmed from Google's model metadata API — **Gemini 3.5 Flash**:
 
 | Limit | Value |
 |-------|-------|
 | **Input context** | **1,048,576 tokens** (1M) |
 | **Output limit** | **65,536 tokens** (64K) |
-| Script's `max_tokens` (analysis) | 8,192 ← **self-imposed bottleneck** |
-| Script's `max_tokens` (transcription) | 4,096 ← **can truncate long transcripts** |
+| Script's `max_tokens` (analysis) | 32,768 (bumped from 8,192 on 2026-08-04 after truncation) |
+| Script's `max_tokens` (transcription) | 4,096 |
 
-The model can output 64K, but the script caps at 8K for analysis and 4K for transcription. Bump these in `analyze_video.py` lines 439 and 340 if you need the full output.
-
-### What consumes the 1M input
-
-| Component | Token cost per unit |
-|-----------|-------------------|
-| JPEG frame (@640p, ~120-200KB) | ~258 tokens per image |
-| Audio (Gemini transcription) | **32 tokens per second** |
-| Caption text | ~1 token per 4 chars (clipped to 20K chars = ~5K tokens) |
-| System prompt + context | ~500 tokens |
-
-### Headroom calculator (10-minute video, balanced mode)
-
-| Component | Cost |
-|-----------|------|
-| 100 frames @ 258 tok each | ~25,800 |
-| 10 min audio @ 32 tok/s | ~19,200 |
-| Caption text (20K chars) | ~5,000 |
-| System prompt + context | ~500 |
-| **Total** | **~50,500** (4.8% of 1M) |
-
-You can fit about **20× this before filling the input window** — so ~3+ hours of video in balanced mode, or ~90 min in detailed mode (200 frames). Full token budget reference: `references/gemini-token-limits.md`
+See `references/gemini-token-limits.md` for full budget details.
 
 ### Practical guidance
 
@@ -170,17 +331,19 @@ If you hit input context limits:
 
 ## Caveats
 
-- **Script-imposed 8K output cap** — the model can output 64K, but the script limits itself. If analysis text is truncated, bump `max_tokens` in `analyze_frames_with_gemini()`.
-- **Audio transcription token cost** — 32 tok/sec is invisible but can dominate the budget on long videos. Prefer captions (yt-dlp) over Gemini transcription when available.
-- **No Groq Whisper** — if yt-dlp can't find captions, the script uses Gemini to transcribe audio, which is slower and more expensive. Set a Groq key for fast transcription with no context cost (Groq Whisper is external, not token-billed).
-- **Private videos** — yt-dlp can't download private/age-restricted videos without cookies. Pass the local file path instead.
-- **Direct URLs** — raw .mp4/.webm URLs download via curl. These are typically faster than yt-dlp but may lack metadata (title, duration detection may fail). Captions won't be available unless embedded or passed as a sidecar file.
+- **Script-imposed 32K output cap** -- the model can output 64K, but the script limits itself to 32,768 (was 8,192 until 2026-08-04, when a real run truncated). If analysis text is STILL truncated, bump `max_tokens` in `analyze_frames_with_gemini()` further.
+- **Audio transcription token cost** -- 32 tok/sec is invisible but can dominate the budget on long videos. Prefer captions (yt-dlp) over Gemini transcription when available.
+- **No Groq Whisper** -- if yt-dlp can't find captions, the script uses Gemini to transcribe audio, which is slower and more expensive.
+- **Private videos** -- yt-dlp can't download private/age-restricted videos without cookies. Pass the local file path instead.
+- **System temp-dir cleanup** -- frames/captions land in a `hermes-video-*` dir under `/var/folders` that macOS can clean mid-session (observed: the .vtt vanished before it could be read). If you need captions after a run, re-extract to a stable path: `yt-dlp --skip-download --write-subs --sub-langs en --sub-format vtt -o /tmp/caps/video "URL"` (or pass `--keep-frames` and copy the .vtt out immediately).
+- **Direct URLs** -- raw .mp4/.webm URLs download via curl. Typically faster than yt-dlp but may lack metadata. Captions only if embedded.
 
 ## Recommended limits
 
-| Duration | Mode | Frames | Input tokens est. | Notes |
-|----------|------|--------|-------------------|-------|
-| < 1 min | minimal | ~15-30 | ~8K-15K | Overkill to use detailed |
-| 1-3 min | balanced | ~40-60 | ~20K-30K | Good quality-cost tradeoff |
-| 3-10 min | balanced | ~60-100 | ~30K-50K | Covers most tutorial content |
-| > 10 min | balanced + start/end | varies | varies | Focus on the relevant section |
+| Duration | Mode | Sampling | Input tokens est. | Notes |
+|----------|------|----------|-------------------|-------|
+| < 1 min | `--fps 8` | ~8 fps | ~200-280K (measured 271K for 30s/242 frames) | Correct choice for judging craft |
+| < 1 min | minimal | 1 fps (~30 frames) | ~10K | Summary only — misreads motion |
+| 1-3 min | balanced | 4 fps (cap 300) | ~40-90K | Good quality-cost tradeoff |
+| 3-10 min | balanced | 4 fps, cap binds | ~40-90K | Cap reports when it binds |
+| > 10 min | balanced + `--start/--end` | varies | varies | Pre-cut the file — `--start/--end` may be ignored |
