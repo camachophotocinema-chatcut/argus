@@ -16,7 +16,7 @@ This skill gives your agent video vision for **any video, from any source**. It 
 - **Direct download** raw MP4/WebM/MOV/etc. URLs (`cdn.example.com/video.mp4`)
 - **Accept local files** you already have on disk (`/path/to/video.mp4`)
 
-Then it extracts frames at scene-aware intervals via ffmpeg, pulls captions (native yt-dlp subs, sidecar files, or Gemini-transcribed audio as fallback), and sends frames + captions to **Gemini 3.5 Flash** for a structured, timestamped analysis.
+Then it samples frames on a density grid measured in **frames per second** (frame-rate aware, so a 24fps film and a 30fps clip get the same temporal coverage), pulls captions (native yt-dlp subs, sidecar files, or Gemini transcription as fallback), attaches the **audio track itself**, and sends everything to **Gemini 3.5 Flash** for a structured, timestamped analysis.
 
 ## Prerequisites
 
@@ -292,10 +292,16 @@ objects the same by construction, which is more reliable than any reviewer's ver
 
 ## Frame extraction details
 
-- Uses ffmpeg's `select='gt(scene,0.3)'` filter for shot-boundary detection
-- Falls back to uniform sampling if scene detection finds < 2 cuts
+- Samples on a uniform grid at the target rate (default 4 fps; `--fps N` to override),
+  clamped to the source frame rate
+- Runs ffmpeg's `select='gt(scene,0.3)'` scene detection and **merges any cuts into the
+  grid**, so shot boundaries are never skipped even when they fall between grid points
 - Frames are JPEG at quality 3 (~120-200KB each)
+- Filenames carry millisecond timestamps (`frame_00123_00051250ms.jpg`)
 - Extracted frames + captions are deleted after analysis unless `--keep-frames`
+
+`frame_sampling` in the output records source fps, source frame count, target and
+effective fps, scene cuts found, and the percentage of source frames actually covered.
 
 ## Download pipeline
 
@@ -337,6 +343,20 @@ If you hit input context limits:
 - **Private videos** -- yt-dlp can't download private/age-restricted videos without cookies. Pass the local file path instead.
 - **System temp-dir cleanup** -- frames/captions land in a `hermes-video-*` dir under `/var/folders` that macOS can clean mid-session (observed: the .vtt vanished before it could be read). If you need captions after a run, re-extract to a stable path: `yt-dlp --skip-download --write-subs --sub-langs en --sub-format vtt -o /tmp/caps/video "URL"` (or pass `--keep-frames` and copy the .vtt out immediately).
 - **Direct URLs** -- raw .mp4/.webm URLs download via curl. Typically faster than yt-dlp but may lack metadata. Captions only if embedded.
+
+## Using this as a Hermes skill
+
+Hermes loads a skill from `SKILL.md`; GitHub renders `README.md`. Rather than keep two
+copies of the same document in sync, `README.md` is the single source of truth and
+`SKILL.md` is a **symlink** to it. Edit either name and you are editing the same file.
+
+```bash
+git clone https://github.com/camachophotocinema-chatcut/argus \
+  ~/.hermes/skills/video-analysis
+```
+
+The repo is then a live working copy of the skill — commit and push your local
+improvements instead of letting them drift unshared.
 
 ## Recommended limits
 
