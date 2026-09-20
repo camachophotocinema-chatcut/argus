@@ -56,6 +56,55 @@ failed and returned empty, and in the audio part, which used a shape the endpoin
 General rule for this script: when a field describes *how* something was produced, it must be
 derived from what actually happened, not asserted. An absent signal is not a pass.
 
+## Pitfall: an empty analysis used to be written out as a successful report
+
+Gemini intermittently returns `completion_tokens: 0` with empty content on a large request
+(observed once at 240 frames / 270K prompt tokens). The script logged
+`Gemini response in 76.4s`, `Analysis complete!`, and wrote `"analysis": "\n"` — a report
+that looks like it ran but contains nothing. Downstream that reads as "the model found
+nothing," which is a different claim from "the call failed."
+
+It now exits non-zero (`SystemExit(2)`) instead of writing the file. If a run produces no
+output file, check the log for the usage line before blaming your invocation:
+
+```bash
+grep -E 'Usage:|EMPTY analysis' run.log
+```
+
+Recovery: simply lower `--max-frames` and re-run. The same segment that returned 0 tokens at
+240 frames returned 4,272 tokens at 150 frames on the next attempt — treat this as a transient
+large-request failure, not a property of the video. Budget for one retry.
+
+**A zero-token completion is not a negative finding.** Never report an empty analysis as
+"no issues found."
+
+## Pitfall: scene detection silently reported 0 cuts on a video full of cuts
+
+`scene_cuts` / `method` read `(no cuts detected)` on a 5-minute short with ~133 hard
+cuts. Cause: the detector runs `ffmpeg ... showinfo` through `run()`, which used
+`capture_output=True` and returned only `result.stdout` — but ffmpeg writes filter
+output on **stderr**, so the `pts_time:` regex always scanned an empty string. The
+field then asserted "no cuts" for a property it had never measured, which is the same
+class of bug as the hardcoded `frame_extraction` label above.
+
+Fix in place: `run()` takes `stderr_to_stdout=True` (uses
+`stdout=PIPE, stderr=STDOUT` — do NOT combine it with `capture_output=True`, which
+raises `ValueError`) and the scene-detection call passes it.
+
+**Check it whenever `scene_cuts` is 0 on real footage.** Verify independently:
+
+```bash
+# cut counts at descending thresholds -- a genuine fast-cut piece is not 0 at 0.3
+ffmpeg -v error -i in.mp4 \
+  -vf "select='gt(scene,0.3)',metadata=print:file=/tmp/sc.txt" -an -f null -
+grep -c pts_time /tmp/sc.txt
+```
+
+Measured on a 300s short: 82 cuts at scene>0.4, 133 at >0.3, 216 at >0.2 — i.e. mean
+shot length ~2.2s. State the threshold when quoting a cut count; the number is not a
+property of the video alone. Do not infer shot boundaries from a coarse sampling grid
+instead — at 3fps every "shot" lands on a 1/3s multiple, which is the grid talking.
+
 ## Pitfall: Gemini's OpenAI-compatible endpoint rejects `{"type":"audio"}`
 
 Audio content parts use OpenAI's shape. This is rejected with HTTP 400
@@ -289,6 +338,28 @@ Two quirks when the input is a slideshow rather than footage:
 object, do not arbitrate between them: lock one canonical instance as an **image reference** and regenerate
 every frame containing that object against it. Attaching the canonical frame as a reference image makes the
 objects the same by construction, which is more reliable than any reviewer's verdict.
+
+## Interpreting a review pass — what the model reliably does and does not do
+
+**Never ask for defects on a clip you are judging the quality of.** A question containing "flag any
+defect / artifact / glitch" manufactures a defect list — the model answers the question you asked.
+Measured on one polished 30s short: a defect-hunting prompt returned four confident "AI artifacts";
+the same file re-run on a neutral question described it as having no visible rendering artifacts.
+Ask what happens, neutrally, then ask targeted follow-ups.
+
+**Treat causal claims as hypotheses, not findings.** A review attributed a jump cut to a specific
+edit ("a direct result of the removed shot"). Independent measurement showed the identical
+discontinuity already existed in the untouched source at the same cut point. The model can correctly
+see *that* something is wrong and be completely wrong about *why*.
+
+**Timestamps and framing labels are approximate.** The same shot was called a "close-up" in one
+pass and a "medium-wide" in the next, and beat timings shift by up to a second between runs. Use a
+review to locate *what* is wrong; use a pixel measurement to place, size or verify it.
+
+**Conversely, trust it on things a meter cannot see.** It reliably caught audio content, physics
+plausibility, whether a specific story beat was present at all, and that a character had become
+frozen mid-shot. Those are exactly the judgements ffmpeg cannot make — treat them as findings, while
+still confirming anything structural yourself.
 
 ## Frame extraction details
 

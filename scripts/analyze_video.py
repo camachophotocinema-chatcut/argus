@@ -34,16 +34,27 @@ def log(msg):
     print(f"[analyze-video] {msg}", file=sys.stderr)
 
 
-def run(cmd, timeout=120, check=True):
-    """Run a command, return stdout."""
-    result = subprocess.run(
-        cmd, capture_output=True, text=True, timeout=timeout
-    )
+def run(cmd, timeout=120, check=True, stderr_to_stdout=False):
+    """Run a command, return stdout.
+
+    Set stderr_to_stdout=True for ffmpeg filters that report on stderr
+    (showinfo/metadata=print) -- with the default capture_output=True those
+    lines never reach stdout and any regex over them silently finds nothing.
+    """
+    if stderr_to_stdout:
+        result = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, timeout=timeout
+        )
+    else:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout
+        )
     if check and result.returncode != 0:
         log(f"Command failed: {' '.join(cmd)}")
-        log(f"STDERR: {result.stderr[:500]}")
+        log(f"STDERR: {(result.stderr or '')[:500]}")
         result.check_returncode()
-    return result.stdout.strip()
+    return (result.stdout or "").strip()
 
 
 def format_timestamp(seconds):
@@ -322,7 +333,7 @@ def extract_frames_ffmpeg(video_path, workdir, mode="balanced", max_frames=None,
             "ffmpeg", "-i", video_path,
             "-filter:v", "select='gt(scene,0.3)',showinfo",
             "-f", "null", "-",
-        ], timeout=120, check=False)
+        ], timeout=120, check=False, stderr_to_stdout=True)
     except Exception as e:
         log(f"Scene detection failed: {e}")
         scene_out = ""
@@ -830,6 +841,14 @@ def main():
             frames, captions_text, title, duration, api_key, args.mode, args.question,
             audio_path=audio_file,
         )
+
+        # A zero-token response is a failure, not an empty finding. Writing it out
+        # as a normal report (with "Analysis complete!") is the same lie as the old
+        # hardcoded frame_extraction label: it asserts success without evidence.
+        if not (analysis or "").strip():
+            log("Gemini returned an EMPTY analysis (completion_tokens=0).")
+            log("Not writing a report. Re-run, or lower --max-frames.")
+            raise SystemExit(2)
 
         # Build output
         result = {
