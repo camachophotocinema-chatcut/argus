@@ -165,7 +165,11 @@ def main():
     ap.add_argument("video")
     ap.add_argument("question")
     ap.add_argument("--fps", type=float, default=24.0)
-    ap.add_argument("--model", default="gemini-3.5-flash")
+    # Default changed after measuring this: gemini-3.5-flash returns 429 (quota exceeded)
+    # while 3.7-flash / 3.8-flash / 3.1-flash-lite all accept native video at fps=24 with the
+    # same 19,008-token accounting (verified = 24.0 fps). Quota is per-MODEL, so the oldest
+    # model in a family is often the one that is spent while its siblings are not.
+    ap.add_argument("--model", default="gemini-3.7-flash")
     ap.add_argument("--start", type=float)
     ap.add_argument("--end", type=float)
     ap.add_argument("--agentic", action="store_true")

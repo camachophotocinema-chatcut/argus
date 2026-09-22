@@ -117,7 +117,7 @@ def main():
                 if backend == "local":
                     txt = ask_local(p, a.question, a.model or LOCAL_DEFAULT)
                 else:
-                    txt = ask_api(p, a.question, a.model or "gemini-3.5-flash")
+                    txt = ask_api(p, a.question, a.model or "gemini-3.7-flash")
             except Exception as e:
                 txt = "FAILED: %s: %s" % (type(e).__name__, e)
             print("\n--- %s (%.1fs) ---" % (backend, time.time() - t0))

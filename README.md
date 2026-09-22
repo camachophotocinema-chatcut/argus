@@ -146,6 +146,37 @@ multimodal, so visual work can run where images reach the model directly.
   percentage reported 9.3% for a subject the verified crop puts near 18%, and separately
   claimed a dog filled 62% of a frame where it is small. Use the foveal crop instead.
 
+## Quota is per-MODEL: sweeping models is the fix, and the oldest is usually the spent one
+
+`gemini-3.5-flash` returned `429 "You exceeded your current quota"` while its siblings served
+the identical request fine. That single fact explains a whole night of confusing failures: the
+vision bridge and the native-video script both defaulted to 3.5-flash, so calls 429'd and
+silently fell back to 1 fps — producing a FABRICATED defect ("the cat instantly teleports")
+that a 24 fps pass later disproved.
+
+Measured on the same clip, same prompt, with the token count as proof of sampling:
+
+| model | result | video tokens | implied fps |
+|---|---|---|---|
+| `gemini-3.7-flash` | 200, correct answer | 19,008 | 24.0 |
+| `gemini-3.8-flash` | 200, correct answer | 19,008 | 24.0 |
+| `gemini-3.1-flash-lite` | 200, correct answer | 19,008 | 24.0 |
+| `gemini-3.5-flash` | **429 quota exceeded** | — | — |
+| `gemini-3.6-flash`, `gemini-3-flash-preview` | 503 high demand | — | — |
+| `gemini-3.1-pro-preview`, `gemini-omni-1.1-flash` | 429 | — | — |
+| `gemini-2.5-flash`, `gemini-2.5-pro` | 404 not available to this key | — | — |
+
+**How to check before concluding an API is broken:** sweep models with a one-word text call
+and report the HTTP status per model. `GET /v1beta/models` lists 42 on this key; a status
+sweep takes about a minute and distinguishes "quota" (429), "demand" (503) and "retired"
+(404) — three problems that need completely different responses. Defaults now point at
+`gemini-3.7-flash`; `gemini-3.1-flash-lite` is the cheap bulk option.
+
+**A dolly-in can be misread as subject movement even at 24 fps.** Verified against the
+animation data: shot 1 holds the cat perfectly static while the camera pushes in, and the pass
+reported the cat "creeping forward". Camera-induced apparent motion is the one class of claim
+to always check against the source data rather than the picture.
+
 ## Pitfall: 1 fps was a hard floor — and a raw frame cap cannot raise it
 
 The old sampler derived `interval = max(1, int(duration / max_frames))`. That `max(...,1)`
