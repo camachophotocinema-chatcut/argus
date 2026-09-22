@@ -146,6 +146,40 @@ multimodal, so visual work can run where images reach the model directly.
   percentage reported 9.3% for a subject the verified crop puts near 18%, and separately
   claimed a dog filled 62% of a frame where it is small. Use the foveal crop instead.
 
+## Cut motion continuity: is the motion the eye is tracking still there after the cut?
+
+`scripts/argus_cut_motion.py` measures the optical-flow field either side of every cut and
+reports whether the incoming shot continues, reverses, or contradicts the outgoing shot's
+motion. It exists because "that cut feels jarring" is a measurable statement, not a taste
+judgement.
+
+Per cut it reports the mean **speed** (px/frame), **direction** (circular mean, degrees),
+**coherence** (`|mean vector| / mean magnitude`: ~1.0 = everything sliding the same way, low =
+vectors fanning in different directions), and the signed **radial** component (positive =
+flowing outward from frame centre, i.e. a push-in).
+
+Two measurement traps it handles:
+
+- **Area weighting.** Whole-frame flow is dominated by whatever covers the most pixels, and in
+  a wide shot that is the far background — whose motion mostly encodes the camera's ROTATION,
+  not its travel. So it reports the **near band** (bottom third, where parallax lives) and the
+  **far band** (top third) separately, plus the angle between them. A push that moves through
+  depth shows a large near/far split (measured on our own footage: 62 degrees). A move that
+  merely slides shows the two bands agreeing.
+- **Angles are not linear.** A mean of 359 and 1 degrees gives 180 — exactly backwards. All
+  directions are averaged as unit vectors, and the per-window `type` is a modal vote, because
+  averaging a string raises.
+
+Verdicts: `MATCHED`, `CONTRAST (reversal)`, `MISMATCH (type change | opposed | angle)`,
+`STATIC SIDE`. **These thresholds are craft heuristics, not published perceptual limits** — the
+tool flags "review this", it does not measure human perception.
+
+```bash
+# flow measurement needs OpenCV, which lives in the ComfyUI venv on this machine
+PY=/Users/javiercamacho/src/comfyui-pony/ComfyUI/.venv/bin/python
+$PY scripts/argus_cut_motion.py video.mp4 --cuts 3.88,7.88 --window 8 --json out.json
+```
+
 ## Quota is per-MODEL: sweeping models is the fix, and the oldest is usually the spent one
 
 `gemini-3.5-flash` returned `429 "You exceeded your current quota"` while its siblings served
