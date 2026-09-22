@@ -109,6 +109,43 @@ found no cuts and collapsed the whole clip into one segment, destroying the per-
 Use an **adaptive** threshold (baseline mean + 2.5 sd, with a small absolute floor so a static
 clip cannot invent cuts).
 
+## The perception stack: fovea + depth + citations, and a truthful manifest
+
+Five tools that together give a text-only reasoning model usable sight. Each was verified
+against ground truth, and the verification rules are the important part.
+
+| Tool | Gives | Verified by |
+|---|---|---|
+| `argus_foveate.py` | full frame (peripheral) + high-res crops per subject (foveal), each stamped `FRAME-nnnn` | crop showed head/legs/tail/chest; the full frame could not resolve the legs |
+| `argus_native_video.py` | video at up to 24 fps into the model | all 3 shots' camera moves correct, vs 1 of 3 from stills |
+| `argus_evidence.py` | kymograph, flow, difference, spectrogram, per-shot motion | cuts found at 3.88/7.88 s; shot 1 measured 0.20 px/frame (imperceptible) |
+| `argus_look.py` | one image through either backend | local and API agreed the cat was airborne at FRAME-0228 |
+| Blender depth pass | exact Z per pixel (better than stereo) | near ground 222 vs far 43; 7 distinct depth levels |
+
+**Local vision is real, with a caveat measured on a 704 px crop:** `ornith:9b` named head,
+legs, tail and shadow correctly (~20 s/image on an M2 Max). `qwen2.5vl:7b` MISSED the tail.
+`minicpm-v` asserted "no shadow cast" when there was one. **A weaker eye that asserts
+something false is worse than a slower one that says less** — so local is a bulk-triage tier,
+not a straight replacement for the API. A `vision` profile now exists whose PRIMARY model is
+multimodal, so visual work can run where images reach the model directly.
+
+### Rules these tools exist to enforce
+
+- **Vision proposes, measurement disposes.** The 24 fps pass reported "the cat's entire body
+  clips directly through the solid platforms". A geometric penetration test across every
+  shot found ZERO events — the model had misread foreshortening (the cat passing in front of
+  bushes) as intersection. Never repeat a model's defect claim without an independent test.
+- **Check penetration, not just occlusion.** `blockout_check.py` sampled 3 frames per shot
+  and only asked "is the subject hidden from the camera". A subject passing THROUGH a solid
+  is a different fault and can vanish from a 3-frame sample. AABB penetration with a
+  0.02 m threshold, ground plane excluded as contact, is the check.
+- **A manifest must report what HAPPENED, not what was requested.** The review manifest
+  claimed "native video analysis run" on a run where no video was found and the step silently
+  skipped. Track outcomes in flags set from the artifacts that exist, and name the video used.
+- **Retire a metric that contradicts a verified observation.** `probe_shot.py`'s subject-size
+  percentage reported 9.3% for a subject the verified crop puts near 18%, and separately
+  claimed a dog filled 62% of a frame where it is small. Use the foveal crop instead.
+
 ## Pitfall: 1 fps was a hard floor — and a raw frame cap cannot raise it
 
 The old sampler derived `interval = max(1, int(duration / max_frames))`. That `max(...,1)`
