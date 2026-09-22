@@ -154,7 +154,7 @@ angdiff = angdiff_full
 
 def analyse(video, window=8, cuts=None, angle_tol=25.0, motion_min=0.6):
     W = window
-    flows = []          # (frame_index_of_pair, flow, describe)
+    flows = []          # (pair_index, flow, describe, frame_difference)
     allf = []
     cx = cy = None
     for i, g, info in frames(video):
@@ -164,7 +164,8 @@ def analyse(video, window=8, cuts=None, angle_tol=25.0, motion_min=0.6):
         if len(allf) == 2:
             fl = flow(allf[0], allf[1])
             cy, cx = fl.shape[0] / 2.0, fl.shape[1] / 2.0
-            flows.append((i, fl, describe(fl, cx, cy)))
+            df = float(np.mean(np.abs(allf[1].astype(np.int16) - allf[0].astype(np.int16))))
+            flows.append((i, fl, describe(fl, cx, cy), df))
     if not flows:
         raise SystemExit("no frames decoded")
 
@@ -194,8 +195,13 @@ def analyse(video, window=8, cuts=None, angle_tol=25.0, motion_min=0.6):
     print("=" * 78)
     for c in cuts:
         cf = int(round(c * fps))
-        before = [d for i, _, d in flows if cf - W <= i < cf]
-        after = [d for i, _, d in flows if cf <= i < cf + W]
+        # Locate the pair that straddles the cut: the largest frame difference near it. That
+        # single pair is a comparison BETWEEN shots, not motion within one, so it is excluded
+        # from both windows. Without this the incoming window inherits an artificial jump.
+        win = [(d, i) for i, _, _, d in flows if cf - 3 <= i <= cf + 3]
+        cross = max(win)[1] if win else cf - 1
+        before = [d for i, _, d, _ in flows if cf - W - 1 <= i < cross]
+        after = [d for i, _, d, _ in flows if cross < i < cross + W + 1]
         if len(before) < 2 or len(after) < 2:
             print("  cut %.2fs: not enough frames either side" % c)
             continue
@@ -221,6 +227,11 @@ def analyse(video, window=8, cuts=None, angle_tol=25.0, motion_min=0.6):
         ang = angdiff(B["direction"], A["direction"])
         ratio = A["speed"] / max(B["speed"], 1e-6)
         typ = (B["type"], A["type"])
+
+        # Is the CAMERA still? The far band (background) is dominated by camera motion; if it
+        # is essentially zero the camera is parked and everything left is subject movement.
+        cam_still = (B["far_speed"] < 0.5 and A["far_speed"] < 0.5)
+        scale_note = ""
 
         if B["speed"] < motion_min or A["speed"] < motion_min:
             verdict = "STATIC SIDE"
@@ -248,7 +259,20 @@ def analyse(video, window=8, cuts=None, angle_tol=25.0, motion_min=0.6):
         print("    INCOMING parallax %.0f deg" % A["parallax"])
         print("    angle between %.0f deg   speed ratio %.2fx   type %s -> %s"
               % (ang, ratio, typ[0], typ[1]))
+        if cam_still and verdict.startswith("MISMATCH") is False:
+            # doctrine (Grammar of the Edit): the preferred cut lands on a static frame. When
+            # both sides are static cameras, speed parity is not required - shot scale changes
+            # how many pixels the subject's motion covers - but direction should still carry.
+            if ang <= angle_tol:
+                verdict = "MATCHED (camera static at cut, action carried over)"
+            scale_note = ("      Camera stationary on both sides (far band %.2f / %.2f px per frame)."
+                          % (B["far_speed"], A["far_speed"]))
+            if abs(ratio - 1.0) > 0.35:
+                scale_note += ("\n      Speed differs %.2fx, which is expected across a change of shot"
+                               " scale and is" % ratio) + " NOT a camera-motion mismatch."
         print("    VERDICT: %s" % verdict)
+        if scale_note:
+            print(scale_note)
         if verdict.startswith("MISMATCH"):
             print("      Why it jars: the eye is tracking one motion field and the cut hands it")
             print("      another. Either match the vector, or make the change big enough to read")
