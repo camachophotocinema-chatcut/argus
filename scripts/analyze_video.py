@@ -485,21 +485,12 @@ def transcribe_with_gemini(audio_path, workdir, api_key):
     }
 
     gemini_url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
-    import urllib.request
 
-    req = urllib.request.Request(
-        gemini_url,
-        data=json.dumps(prompt).encode(),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        },
-        method="POST",
-    )
+    result, err = _post_gemini(gemini_url, prompt, timeout=120)
+    if err or result is None:
+        return None, ""
 
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            result = json.loads(resp.read().decode())
         transcript = result.get("choices", [{}])[0].get("message", {}).get("content", "")
         log(f"Transcription length: {len(transcript)} chars")
 
@@ -507,12 +498,8 @@ def transcribe_with_gemini(audio_path, workdir, api_key):
         transcript_file = Path(workdir) / "transcript.txt"
         transcript_file.write_text(transcript)
         return str(transcript_file), transcript
-    except urllib.error.HTTPError as e:
-        body = e.read().decode()
-        log(f"Gemini transcription failed: HTTP {e.code} {body[:300]}")
-        return None, ""
     except Exception as e:
-        log(f"Gemini transcription failed: {type(e).__name__}: {e}")
+        log(f"Gemini transcription parse failed: {type(e).__name__}: {e}")
         return None, ""
 
 
@@ -627,52 +614,110 @@ def analyze_frames_with_gemini(frames, captions_text, title, duration, api_key, 
 
     gemini_url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 
-    import urllib.request
-
-    req = urllib.request.Request(
-        gemini_url,
-        data=json.dumps(payload).encode(),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        },
-        method="POST",
-    )
-
     log(f"Sending {frame_count} frames to Gemini...")
     start_time = time.time()
 
-    try:
-        with urllib.request.urlopen(req, timeout=300) as resp:
-            result = json.loads(resp.read().decode())
-        elapsed = time.time() - start_time
-        log(f"Gemini response in {elapsed:.1f}s")
+    result, err = _post_gemini(gemini_url, payload, timeout=300)
+    if err or result is None:
+        return err
 
-        analysis = result.get("choices", [{}])[0].get("message", {}).get("content", "")
-        usage = result.get("usage", {})
-        log(f"Usage: {json.dumps(usage)}")
-        return analysis
-    except urllib.error.HTTPError as e:
-        body = e.read().decode()
-        log(f"Gemini API error {e.code}: {body[:500]}")
-        return f"Gemini API error {e.code}: {body[:500]}"
-    except Exception as e:
-        log(f"Gemini API call failed: {e}")
-        return f"Analysis failed: {e}"
+    elapsed = time.time() - start_time
+    log(f"Gemini response in {elapsed:.1f}s")
+
+    analysis = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+    usage = result.get("usage", {})
+    log(f"Usage: {json.dumps(usage)}")
+    return analysis
 
 
 def get_api_key():
-    """Get Google/Gemini API key."""
-    key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
-    if key and key != "your_google_ai_studio_key_here":
-        return key
-    # Try hermes .env
-    env_path = os.path.expanduser("~/.hermes/.env")
-    if os.path.exists(env_path):
-        for line in Path(env_path).read_text().split("\n"):
-            if line.startswith("GOOGLE_API_KEY=") and "your_" not in line:
-                return line.split("=", 1)[1].strip()
-    return None
+    """Get Google/Gemini API key (first available)."""
+    return (get_api_keys() or [None])[0]
+
+
+def get_api_keys():
+    """Ordered list of Gemini API keys: primary first, then any backups.
+
+    Failover exists because the primary key hit its monthly spend cap (HTTP 429
+    RESOURCE_EXHAUSTED), which killed vision analysis outright. A 429 is a
+    per-PROJECT limit, so a key from a different project keeps working.
+    Backup source: ~/.hermes/secrets/gemini-backup.env (chmod 600) or env.
+    """
+    keys = []
+
+    def _push(v):
+        v = (v or "").strip()
+        if v and "your_" not in v and v not in keys:
+            keys.append(v)
+
+    _push(os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY"))
+    if not keys:
+        env_path = os.path.expanduser("~/.hermes/.env")
+        if os.path.exists(env_path):
+            for line in Path(env_path).read_text().split("\n"):
+                if line.startswith("GOOGLE_API_KEY=") and "your_" not in line:
+                    _push(line.split("=", 1)[1])
+
+    _push(os.environ.get("GEMINI_API_KEY_BACKUP"))
+    backup_path = os.path.expanduser("~/.hermes/secrets/gemini-backup.env")
+    if os.path.exists(backup_path):
+        for line in Path(backup_path).read_text().split("\n"):
+            if line.startswith("GEMINI_API_KEY_BACKUP=") and "your_" not in line:
+                _push(line.split("=", 1)[1])
+
+    return keys
+
+
+def _post_gemini(url, payload, timeout=300):
+    """POST to the Gemini OpenAI-compatible endpoint, rotating keys on quota errors.
+
+    Returns (parsed_json_or_None, error_string_or_None). A 429 is a per-PROJECT
+    cap, so when the primary is spent we retry the SAME request with the backup key
+    rather than failing the whole analysis.
+    """
+    import urllib.request
+    import urllib.error
+
+    keys = get_api_keys()
+    if not keys:
+        return None, "No GOOGLE_API_KEY found. Set it in .env or environment."
+
+    last = None
+    transient = (500, 502, 503, 504)
+    for i, k in enumerate(keys):
+        for attempt in range(3):
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode(),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {k}",
+                },
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    return json.loads(resp.read().decode()), None
+            except urllib.error.HTTPError as e:
+                body = e.read().decode()
+                last = f"Gemini API error {e.code}: {body[:500]}"
+                if e.code in transient and attempt < 2:
+                    # 503 = server-side demand spike, not a credential problem.
+                    # Rotating keys would not help; wait it out.
+                    wait = 5 * (attempt + 1)
+                    log(f"Gemini {e.code} (transient); retry {attempt + 2}/3 in {wait}s")
+                    time.sleep(wait)
+                    continue
+                if e.code in (429, 401, 403) and i + 1 < len(keys):
+                    log(f"Gemini key #{i + 1} refused this request ({e.code}); rotating to backup key")
+                    break
+                log(last)
+                return None, last
+            except Exception as e:
+                last = f"Analysis failed: {type(e).__name__}: {e}"
+                log(last)
+                return None, last
+    return None, last
 
 
 def main():

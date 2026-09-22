@@ -22,8 +22,31 @@ Then it samples frames on a density grid measured in **frames per second** (fram
 
 - **ffmpeg** — installed and on `PATH`
 - **yt-dlp** — installed via brew (`brew install yt-dlp`)
-- **GOOGLE_API_KEY** -- set in `~/.hermes/.env` (already configured)
+- **GOOGLE_API_KEY** -- set in `~/.hermes/.env`
+- **GEMINI_API_KEY_BACKUP** -- optional backup in `~/.hermes/secrets/gemini-backup.env` (chmod 600)
 - **Groq key** -- NOT configured; audio transcription falls back to Gemini 3.5 Flash
+
+## Key failover: a 429 is a per-PROJECT cap, so a second key keeps working
+
+The primary key hit `429 RESOURCE_EXHAUSTED` ("your project has exceeded its monthly
+spending cap") and vision analysis stopped dead. The cap is enforced per **project**, not
+per key or per account — so a key issued under a *different* project keeps serving. Raise
+the cap at https://ai.studio/spend; you cannot top it up.
+
+`_post_gemini()` now owns every Gemini request and handles two distinct failure classes,
+which are NOT interchangeable:
+
+- **429 / 401 / 403** → credential or quota problem. Rotate to the next key in
+  `get_api_keys()` (primary, then `GEMINI_API_KEY_BACKUP`) and retry the *same* request.
+- **500 / 502 / 503 / 504** → transient, server-side (e.g. `503 UNAVAILABLE`, "model is
+  currently experiencing high demand"). Retry the *same key* up to 3 times with 5 s then
+  10 s backoff. Rotating keys here is useless — the fault is upstream, and burning a
+  backup key on it just wastes it.
+
+Verified end-to-end with the primary spent: the log shows `Gemini key #1 refused this
+request (429); rotating to backup key` for both the transcription and the frame call, and
+the analysis completes. Do not conclude a model is unavailable from one 503 — retest with
+a minimal single-image payload before changing the model name.
 
 ## Pitfall: 1 fps was a hard floor — and a raw frame cap cannot raise it
 
