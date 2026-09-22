@@ -48,6 +48,67 @@ request (429); rotating to backup key` for both the transcription and the frame 
 the analysis completes. Do not conclude a model is unavailable from one 503 — retest with
 a minimal single-image payload before changing the model name.
 
+## Native video at a real frame rate — stills cannot see motion
+
+**The measured failure that forced this.** On a 12 s previz, stills-based analysis at 4 fps
+reported *"the camera remains completely static"* for shot 2 — a shot where the camera
+provably sweeps 3.8 m sideways. A vision model cannot infer motion from sparse stills; it
+guesses. Give it the video instead.
+
+`scripts/argus_native_video.py` uploads the file, sends it as a video part, and sets the
+sampling rate explicitly:
+
+```bash
+python3 scripts/argus_native_video.py clip.mp4 "what does the camera do?" --fps 24
+python3 scripts/argus_native_video.py clip.mp4 "per-shot camera move" --interactions --model gemini-3.7-flash
+```
+
+Measured behaviour, all verified on this machine:
+
+- **`fps` is accepted up to 24, and 30 is NOT.** `--fps 30` returns `INVALID_ARGUMENT`. A
+  30 fps source must be analysed at 24 or via agentic mode; there is no higher-rate path.
+- **24 fps cost, measured:** 19,008 video tokens for a 12 s clip (~66 tokens per frame at the
+  default media resolution).
+- **It fixed the verdict.** At 24 fps the same clip returns *shot 1 dollying in, shot 2
+  tracking right, shot 3 craning up* — with the extra catch that the cat moves at the same
+  speed as the tracking camera, keeping it centred. Stills analysis had got 1 of 3 shots
+  right; native video got 3 of 3.
+- **Agentic processing works on `gemini-3.7-flash`, not on `gemini-3.5-flash`** (which returns
+  *"Agentic video processing is not enabled for models/gemini-3.5-flash"*). It lives on the
+  Interactions API (`/v1beta/interactions`) with `processing: "agentic"` — NOT on
+  `models:generateContent`, which rejects it with *Unknown name "processing"*. When it runs,
+  the token accounting proves the model fetches frames itself: `tool_use_tokens` shows video
+  AND image pulls over three model invocations, and it was both correct and cheaper
+  (~7.7 k tokens vs 19.6 k for the fixed-rate path).
+
+### Rule: record the EFFECTIVE sampling, never the requested one
+
+A rejected `fps=30` was logged as `fps: 30` while the answer had actually been produced at the
+API's default **1 fps** — 792 video tokens for a 12 s clip, which is ~12 frames, not 360. That
+is an estimate in measurement's clothing, in the tool's own output file. The script now
+records `fps_requested`, `fps_effective`, `fell_back_to_default` and `fps_implied_by_tokens`,
+and prints the implied rate next to the requested one. **Cross-check any claimed sampling
+against the API's own token accounting**; tokens per frame at default resolution is ~66, so
+`fps_implied = (video_tokens / 66) / duration`.
+
+## Making motion and audio VISIBLE: the evidence bundle
+
+`scripts/argus_evidence.py` converts a clip into images and numbers a model can read — useful
+alongside the native path, and essential when comparing versions of the same shot:
+
+- **kymograph** (space-time slices at left/centre/right): a static camera gives vertical
+  stripes, a lateral move gives parallel diagonals, a zoom gives converging ones. One image,
+  motion made unambiguous.
+- **optical-flow contact sheet** (hue = direction, brightness = speed), **frame-difference
+  sheet** (what changed, where), **spectrogram**, **waveform**, and a motion+audio time plot.
+- **per-shot motion in px/frame with a verdict**, cut detection, and loudness per 0.5 s.
+
+Calibration lesson: cut detection used a fixed 0.22 frame-difference floor, which sat ABOVE
+both real cuts (measured 0.134 and 0.201) while the largest in-shot motion was 0.0797 — so it
+found no cuts and collapsed the whole clip into one segment, destroying the per-shot readout.
+Use an **adaptive** threshold (baseline mean + 2.5 sd, with a small absolute floor so a static
+clip cannot invent cuts).
+
 ## Pitfall: 1 fps was a hard floor — and a raw frame cap cannot raise it
 
 The old sampler derived `interval = max(1, int(duration / max_frames))`. That `max(...,1)`
